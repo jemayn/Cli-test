@@ -116,10 +116,16 @@ jobs:
 
       - name: Deploy to live slot
         id: slot
+        # TEMPORARY: --no-schema-extraction works around a dev-Cloud bug where schema
+        # extraction on a slot deployment fails ("could not be converted to System.Guid.
+        # Path: $.TaskId", deployment bb9340b9-bee9-4889-970b-a969ff4a8130, 27-11-2026).
+        # Live's Deploy schema is NOT refreshed from the .uda files while this is in place.
+        # Remove once Cloud is fixed.
         run: |
           umbraco cloud deployments deploy \
             --environment live \
             --slot \
+            --no-schema-extraction \
             --path out \
             --type artifact \
             --message "$(git log -1 --format='%s (%h)')" \
