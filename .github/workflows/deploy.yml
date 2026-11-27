@@ -1,0 +1,85 @@
+name: Deploy to Umbraco Cloud
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deployment pipeline at a time: a second run waits instead of fighting over the slot.
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The project lives on the dev Cloud platform; drop this to target production Cloud.
+  UMBRACO_CLOUD_API_URL: https://api.dev-cloud.umbraco.com
+  UMBRACO_CLOUD_API_KEY: ${{ secrets.UMBRACO_CLOUD_API_KEY }}
+  UMBRACO_CLOUD_PROJECT_ID: ${{ secrets.UMBRACO_CLOUD_PROJECT_ID }}
+  # Pinned: the CLI is an alpha and can change flags between builds. Bump deliberately.
+  UMBRACO_CLI_VERSION: 0.1.1-alpha.58.g7ba0e32
+  UMBRACO_CLI_FEED: https://www.myget.org/F/umbracoprereleases/api/v3/index.json
+  DOTNET_VERSION: 10.0.x
+  TEST_URL: https://test-cli-test.euwest01.rainbowsrock.net
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish
+        run: dotnet publish src/Cli.Test/Cli.Test.csproj -c Release -o out
+
+      - name: Write build marker
+        # smoke.sh checks this to prove an environment runs this exact build.
+        run: echo "${{ github.sha }}" > out/wwwroot/build-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: out
+          include-hidden-files: true
+          if-no-files-found: error
+
+  deploy-test:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: test
+      url: ${{ env.TEST_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: out
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install Umbraco CLI
+        run: |
+          dotnet tool install --global Umbraco.Cli --version "$UMBRACO_CLI_VERSION" --add-source "$UMBRACO_CLI_FEED"
+          umbraco --version
+
+      - name: Deploy to test
+        run: |
+          umbraco cloud deployments deploy \
+            --environment test \
+            --path out \
+            --type artifact \
+            --message "$(git log -1 --format='%s (%h)')" \
+            --version "${{ github.run_number }}" \
+            --no-progress
+
+      - name: Smoke check test
+        run: .github/scripts/smoke.sh "$TEST_URL" "${{ github.sha }}"
