@@ -60,6 +60,9 @@ jobs:
     environment:
       name: test
       url: ${{ env.TEST_URL }}
+    outputs:
+      # The Cloud artifact this job uploaded; deploy-live deploys the same one without re-uploading.
+      artifact_id: ${{ steps.deploy.outputs.artifact_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -78,6 +81,7 @@ jobs:
           umbraco --version
 
       - name: Deploy to test
+        id: deploy
         run: |
           umbraco cloud deployments deploy \
             --environment test \
@@ -85,7 +89,14 @@ jobs:
             --type artifact \
             --message "$(git log -1 --format='%s (%h)')" \
             --version "${{ github.run_number }}" \
-            --no-progress
+            --output json \
+            --no-progress | tee test.json
+          id="$(jq -r '.artifactId // empty' test.json)"
+          if [[ -z "$id" ]]; then
+            echo "::error::No artifactId in the deploy output."
+            exit 1
+          fi
+          echo "artifact_id=$id" >> "$GITHUB_OUTPUT"
 
       - name: Smoke check test
         run: .github/scripts/smoke.sh "$TEST_URL" "${{ github.sha }}"
@@ -99,11 +110,6 @@ jobs:
       url: ${{ env.LIVE_URL }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: site
-          path: out
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -126,10 +132,8 @@ jobs:
             --environment live \
             --slot \
             --no-schema-extraction \
-            --path out \
-            --type artifact \
+            --artifact-id "${{ needs.deploy-test.outputs.artifact_id }}" \
             --message "$(git log -1 --format='%s (%h)')" \
-            --version "${{ github.run_number }}" \
             --output json \
             --no-progress | tee slot.json
           id="$(jq -r '.deploymentId // empty' slot.json)"
