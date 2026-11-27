@@ -23,6 +23,12 @@ env:
   UMBRACO_CLI_FEED: https://www.myget.org/F/umbracoprereleases/api/v3/index.json
   DOTNET_VERSION: 10.0.x
   TEST_URL: https://test-cli-test.euwest01.rainbowsrock.net
+  SLOT_URL: https://prewarm-cli-test.euwest01.rainbowsrock.net
+  LIVE_URL: https://cli-test.euwest01.rainbowsrock.net
+
+defaults:
+  run:
+    shell: bash # -eo pipefail, so a failing command in a pipe fails the step
 
 jobs:
   build:
@@ -83,3 +89,72 @@ jobs:
 
       - name: Smoke check test
         run: .github/scripts/smoke.sh "$TEST_URL" "${{ github.sha }}"
+
+  deploy-live:
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    # The `live` GitHub environment has a required reviewer: the run waits here for approval.
+    environment:
+      name: live
+      url: ${{ env.LIVE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: out
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install Umbraco CLI
+        run: |
+          dotnet tool install --global Umbraco.Cli --version "$UMBRACO_CLI_VERSION" --add-source "$UMBRACO_CLI_FEED"
+          umbraco --version
+
+      - name: Deploy to live slot
+        id: slot
+        run: |
+          umbraco cloud deployments deploy \
+            --environment live \
+            --slot \
+            --path out \
+            --type artifact \
+            --message "$(git log -1 --format='%s (%h)')" \
+            --version "${{ github.run_number }}" \
+            --output json \
+            --no-progress | tee slot.json
+          id="$(jq -r '.deploymentId // empty' slot.json)"
+          if [[ -z "$id" ]]; then
+            echo "::error::No deploymentId in the deploy output; not swapping."
+            exit 1
+          fi
+          echo "deployment_id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke check slot
+        run: .github/scripts/smoke.sh "$SLOT_URL" "${{ github.sha }}"
+
+      - name: Swap slot into production
+        id: swap
+        run: |
+          umbraco cloud deployments swap \
+            --environment live \
+            --deployment-id "${{ steps.slot.outputs.deployment_id }}" \
+            --no-progress
+
+      - name: Smoke check live
+        run: .github/scripts/smoke.sh "$LIVE_URL" "${{ github.sha }}"
+
+      - name: Reject slot (production unchanged)
+        # Runs when anything before the swap failed or the run was cancelled, so an
+        # unverified deployment never lingers awaiting a swap. Doesn't run once swapped.
+        if: (failure() || cancelled()) && steps.swap.outcome != 'success'
+        env:
+          DEPLOYMENT_ID: ${{ steps.slot.outputs.deployment_id }}
+        run: |
+          args=(--environment live --no-progress)
+          if [[ -n "$DEPLOYMENT_ID" ]]; then args+=(--deployment-id "$DEPLOYMENT_ID"); fi
+          umbraco cloud deployments reject "${args[@]}" \
+            || echo "::warning::Reject failed (maybe nothing was awaiting a swap); check the live environment."
